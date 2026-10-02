@@ -44,7 +44,7 @@ export default function MLOpsDashboard({ language }) {
             const res  = await fetch(`${API}/retrain`, { method: 'POST' });
             const data = await res.json();
             setRetrainResult(data);
-            if (data.status === 'upgraded') fetchAll();
+            if (data.status === 'upgraded' || data.status === 'refreshed') fetchAll();
         } catch (e) {
             setRetrainResult({ error: e.message });
         } finally {
@@ -144,8 +144,34 @@ export default function MLOpsDashboard({ language }) {
                                     <span className="mini-val">{modelInfo.rmse ?? '—'}</span>
                                 </div>
                             </div>
+
+                            {modelInfo.champion && (
+                                <p style={{ fontSize: '0.8rem', color: '#555', margin: '0.75rem 0 0.25rem' }}>
+                                    Deployed: <b>{modelInfo.champion}</b> — {modelInfo.champion_description}.
+                                    Errors in t/ha on a time-based backtest.
+                                </p>
+                            )}
+                            {modelInfo.leaderboard?.length > 0 && (
+                                <table style={{ width: '100%', fontSize: '0.78rem', borderCollapse: 'collapse', marginTop: '0.5rem' }}>
+                                    <thead>
+                                        <tr style={{ textAlign: 'left', color: '#666' }}>
+                                            <th>Candidate</th><th>MAE</th><th>R²</th><th>Median % err</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {modelInfo.leaderboard.map(r => (
+                                            <tr key={r.model} style={{ fontWeight: r.model === modelInfo.champion ? 700 : 400 }}>
+                                                <td>{r.model}</td>
+                                                <td>{r.mae?.toFixed(3)}</td>
+                                                <td>{r.r2_yield?.toFixed(3)}</td>
+                                                <td>{r.mdape_pct?.toFixed(1)}%</td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            )}
                         </>
-                    ) : <p className="no-data">Run mlflow_train.py to populate model info.</p>}
+                    ) : <p className="no-data">Run <code>python -m ml.pipeline train</code> to populate model info.</p>}
                 </div>
 
                 {/* ── Card 2: Drift Detection ──────────────────────────────── */}
@@ -249,12 +275,13 @@ export default function MLOpsDashboard({ language }) {
                     </div>
 
                     <p className="retrain-desc">
-                        Triggers a full retrain on <code>final_training_data.csv</code>.
-                        The new model is promoted only if R² improves by &gt;0.5%.
+                        Re-scores every candidate on the same time-based backtest, using the base data plus any
+                        new harvest records in <code>new_observations.csv</code>. A challenger replaces the deployed
+                        model only if it cuts MAE by at least 2%.
                     </p>
 
                     <div className="pipeline-steps">
-                        {['Load Data', 'Train GBR', 'Evaluate', 'Compare vs Prod', 'Promote / Discard'].map((step, i) => (
+                        {['Load Data', 'Backtest Candidates', 'Re-score Deployed', 'Compare', 'Promote / Refit / Keep'].map((step, i) => (
                             <div key={step} className="pipeline-step">
                                 <span className="step-num">{i + 1}</span>
                                 <span className="step-name">{step}</span>
@@ -278,7 +305,7 @@ export default function MLOpsDashboard({ language }) {
                                 <span>Error: {retrainResult.error}</span>
                             ) : (
                                 <>
-                                    <strong>{retrainResult.status === 'upgraded' ? 'Model Upgraded' : 'No Change'}</strong>
+                                    <strong>{retrainResult.status === 'upgraded' ? 'Model Upgraded' : retrainResult.status === 'refreshed' ? 'Refit on New Data' : 'No Change'}</strong>
                                     <span>New R²: {retrainResult.new_r2} | Old R²: {retrainResult.old_r2}</span>
                                     <span className="retrain-reason">{retrainResult.reason}</span>
                                 </>

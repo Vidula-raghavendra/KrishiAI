@@ -1,8 +1,9 @@
 flask
 flask-cors
-pandas
-numpy
-scikit-learn==1.6.1   # must match the version the .pkl files were saved with
-mlflow
 requests
+pandas==3.0.5
+numpy==2.5.3
 scipy
+joblib
+scikit-learn==1.9.1   # must match the version models/yield_model.joblib was saved with; retrain if you change it
+mlflow                # optional: if installed, every backtest comparison is logged to training_workspace/mlruns

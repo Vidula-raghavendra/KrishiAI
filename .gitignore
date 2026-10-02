@@ -26,3 +26,6 @@ drift_report.json
 
 # AI-assistant config (kept local)
 .claude/
+
+# Archived models written by retraining
+models/archive/

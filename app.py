@@ -1,76 +1,77 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pandas as pd
-import pickle
 import numpy as np
 import datetime
 import requests
 import json
 import os
-import subprocess
-import sys
+import threading
+
+from ml import config as ml_config
+from ml.data import load_training_data, unsupported_crops
+from ml.pipeline import load_bundle, load_model_info, run as run_pipeline
+from ml.drift import run_drift_check
 
 app = Flask(__name__)
 CORS(app)
+ROOT = os.path.dirname(os.path.abspath(__file__))
 
-# ── Load Model and Encoders ────────────────────────────────────────────────────
-try:
-    with open('agriculture_model_improved.pkl', 'rb') as f:
-        model = pickle.load(f)
-    with open('label_encoders_improved.pkl', 'rb') as f:
-        encoders = pickle.load(f)
-        scaler = encoders.get('scaler')
-    print("Model and encoders loaded successfully.")
-except Exception as e:
-    print(f"Error loading model: {e}")
-    model = None
-    encoders = None
-    scaler = None
+# ── Load the deployed yield model ──────────────────────────────────────────────
+# One file, written atomically by ml.pipeline. Train it with:
+#     python -m ml.pipeline train
+bundle = None
+_model_lock = threading.Lock()
+
+
+def _load_model():
+    global bundle
+    try:
+        b = load_bundle()
+        with _model_lock:
+            bundle = b
+        print(f"Model loaded: {b['name']} (trained {b['trained_at']}).")
+    except Exception as e:
+        print(f"Error loading model: {e}. Run `python -m ml.pipeline train`.")
+
+
+_load_model()
+UNSUPPORTED_CROPS = set(unsupported_crops())
 
 # ── Load Monthly Rainfall Averages ─────────────────────────────────────────────
 try:
-    rainfall_df = pd.read_csv('rainfall_monthly_averages.csv')
+    rainfall_df = pd.read_csv(os.path.join(ROOT, 'rainfall_monthly_averages.csv'))
     rainfall_data = rainfall_df.set_index('District').to_dict('index')
     print("Rainfall data loaded successfully.")
 except Exception as e:
     print(f"Error loading rainfall data: {e}")
     rainfall_data = {}
 
-# ── Load Training Data for Stats ──────────────────────────────────────────────
+# ── Load cleaned training data for historical stats ───────────────────────────
 try:
-    training_df = pd.read_csv('training_workspace/final_training_data.csv')
+    training_df = load_training_data()
     print(f"Training data loaded: {len(training_df)} records.")
 except Exception as e:
     print(f"Error loading training data: {e}")
     training_df = None
 
-# ── District Slope Data (actual Meghalaya geography) ──────────────────────────
-# ── MLOps Config ──────────────────────────────────────────────────────────────
-PRED_LOG_PATH   = os.path.join(os.path.dirname(__file__), 'prediction_log.jsonl')
-MODEL_INFO_PATH = os.path.join(os.path.dirname(__file__), 'model_info.json')
-DRIFT_CACHE     = os.path.join(os.path.dirname(__file__), 'drift_report.json')
-WORKSPACE       = os.path.join(os.path.dirname(__file__), 'training_workspace')
-
 
 def _log_prediction(entry: dict):
-    """Append a prediction input record to prediction_log.jsonl."""
+    """Append a prediction request to prediction_log.jsonl (read by ml.drift)."""
     entry['ts'] = datetime.datetime.now().isoformat()
-    with open(PRED_LOG_PATH, 'a') as f:
+    with open(ml_config.PRED_LOG_PATH, 'a') as f:
         f.write(json.dumps(entry) + '\n')
 
 
 def _load_model_info():
-    if os.path.exists(MODEL_INFO_PATH):
-        with open(MODEL_INFO_PATH) as f:
-            return json.load(f)
-    return {
-        'model_name':    'agriculture-yield-model',
+    return load_model_info() or {
+        'model_name':    'krishi-yield-model',
         'training_date': 'unknown',
         'n_samples':     'unknown',
         'r2':            None,
         'mae':           None,
         'rmse':          None,
-        'version':       1,
+        'version':       0,
     }
 
 
@@ -141,18 +142,46 @@ CROP_CALENDAR_STAGES = {
 }
 
 
-def _make_features(district, season, crop, area, rainfall):
-    """Build a named-column DataFrame so sklearn doesn't warn about feature names."""
-    district_enc = encoders['district'].transform([district])[0]
-    season_enc   = encoders['season'].transform([season])[0]
-    crop_enc     = encoders['crop'].transform([crop])[0]
-    num_df       = pd.DataFrame([[area, rainfall]], columns=['Area', 'Rainfall'])
-    scaled       = scaler.transform(num_df)
-    features     = pd.DataFrame(
-        [[district_enc, season_enc, crop_enc, scaled[0][0], scaled[0][1]]],
-        columns=['District_Encoded', 'Season_Encoded', 'Crop_Encoded', 'Area', 'Rainfall']
-    )
-    return features
+class PredictionError(ValueError):
+    pass
+
+
+def _predict(district, season, crop, area, rainfall=None):
+    """Predict yield (t/ha) for one district/season/crop and scale it to the farm.
+
+    The model predicts yield per hectare, so farm size does not change the
+    yield; production is yield x area.
+    """
+    with _model_lock:
+        b = bundle
+    if b is None:
+        raise PredictionError("Model not loaded. Run `python -m ml.pipeline train`.")
+    district = (district or '').upper()
+    if crop in UNSUPPORTED_CROPS:
+        raise PredictionError(f"{crop} is reported in bales, not tonnes, so it is not modelled.")
+    for value, allowed, label in [(district, b['districts'], 'district'),
+                                  (season, b['seasons'], 'season'),
+                                  (crop, b['crops'], 'crop')]:
+        if value not in allowed:
+            raise PredictionError(f"Unknown {label}: {value!r}")
+    if area is None or area <= 0:
+        raise PredictionError("Area must be a positive number of hectares.")
+
+    model = b['model']
+    row = pd.DataFrame([{'District_Name': district, 'Season': season, 'Crop': crop,
+                         'Rainfall': rainfall if (model.uses_rainfall and rainfall) else np.nan}])
+    y = float(model.predict(row)[0])
+    has_history = bool(model.has_history(row)[0])
+    lo, hi = b['interval']
+    return {
+        'yield': y,
+        'yield_range': [y * lo, y * hi],
+        'production': y * area,
+        'production_range': [y * lo * area, y * hi * area],
+        'has_history': has_history,
+        'model': b['name'],
+        'model_uses_rainfall': bool(model.uses_rainfall),
+    }
 
 
 def _get_district_annual_avg_rainfall(district):
@@ -171,18 +200,20 @@ def home():
         "status": "online",
         "message": "Smart Agriculture Backend is Running",
         "endpoints": ["/info", "/predict", "/forecast", "/recommend", "/advisory",
-                      "/district-info", "/crop-stats", "/pro-analysis"]
+                      "/district-info", "/crop-stats", "/pro-analysis", "/model-info",
+                      "/drift-report", "/retrain", "/prediction-stats"]
     })
 
 
 @app.route('/info', methods=['GET'])
 def get_info():
-    if not encoders:
+    if bundle is None:
         return jsonify({"error": "Model not loaded"}), 500
     return jsonify({
-        "districts": list(encoders['district'].classes_),
-        "seasons":   list(encoders['season'].classes_),
-        "crops":     list(encoders['crop'].classes_)
+        "districts": bundle['districts'],
+        "seasons":   bundle['seasons'],
+        "crops":     bundle['crops'],
+        "unsupported_crops": sorted(UNSUPPORTED_CROPS),
     })
 
 
@@ -248,116 +279,114 @@ def crop_stats():
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    if not model or not encoders:
-        return jsonify({"error": "Model not loaded"}), 500
-
-    data     = request.json
-    district = data.get('district')
+    data     = request.json or {}
+    district = (data.get('district') or '').upper()
     season   = data.get('season')
     crop     = data.get('crop')
-    area     = float(data.get('area'))
 
-    # Auto-use district annual avg if rainfall not provided
     rainfall = data.get('rainfall')
+    rainfall_source = 'user'
     if not rainfall or float(rainfall) == 0:
         rainfall = _get_district_annual_avg_rainfall(district)
-    else:
-        rainfall = float(rainfall)
+        rainfall_source = 'district_average'
+    rainfall = float(rainfall)
 
     try:
-        features        = _make_features(district, season, crop, area, rainfall)
-        prediction_log  = model.predict(features)[0]
-        prediction      = np.expm1(prediction_log)
-        yield_per_ha    = prediction / area if area > 0 else 0
-
-        # Get historical stats for context
-        hist = None
-        if training_df is not None:
-            mask = (training_df['Crop'] == crop) & (training_df['District_Name'] == district)
-            hist_data = training_df[mask]
-            if not hist_data.empty:
-                hist = {
-                    "avg_historical_yield": round(float(hist_data['Yield'].mean()), 2),
-                    "max_historical_yield": round(float(hist_data['Yield'].max()), 2),
-                }
-
-        _log_prediction({
-            'district': district, 'season': season, 'crop': crop,
-            'area': area, 'rainfall': round(rainfall, 1)
-        })
-
-        return jsonify({
-            "production":      round(prediction, 2),
-            "yield":           round(yield_per_ha, 3),
-            "rainfall_used":   round(rainfall, 1),
-            "historical_context": hist
-        })
-    except Exception as e:
+        area = float(data.get('area'))
+        out  = _predict(district, season, crop, area, rainfall)
+    except (TypeError, ValueError) as e:
         return jsonify({"error": str(e)}), 400
+
+    hist = None
+    if training_df is not None:
+        h = training_df[(training_df['Crop'] == crop) & (training_df['District_Name'] == district)
+                        & (training_df['Season'] == season)]
+        if not h.empty:
+            hist = {
+                "avg_historical_yield": round(float(h['Yield'].mean()), 2),
+                "max_historical_yield": round(float(h['Yield'].max()), 2),
+                "last_recorded_yield":  round(float(h.sort_values('Crop_Year')['Yield'].iloc[-1]), 2),
+                "last_recorded_year":   int(h['Crop_Year'].max()),
+                "records":              int(len(h)),
+            }
+
+    _log_prediction({
+        'district': district, 'season': season, 'crop': crop, 'area': area,
+        'rainfall': round(rainfall, 1), 'rainfall_source': rainfall_source,
+        'has_history': out['has_history'], 'predicted_yield': round(out['yield'], 3),
+        'model': out['model'],
+    })
+
+    return jsonify({
+        "production":          round(out['production'], 2),
+        "production_range":    [round(v, 2) for v in out['production_range']],
+        "yield":               round(out['yield'], 3),
+        "yield_range":         [round(v, 3) for v in out['yield_range']],
+        "unit":                "tonnes (yield in tonnes per hectare)",
+        "has_history":         out['has_history'],
+        "confidence_note":     None if out['has_history'] else
+                               "No past records for this district, crop and season; estimate is based on "
+                               "similar records and is much less reliable.",
+        "model":               out['model'],
+        "model_uses_rainfall": out['model_uses_rainfall'],
+        "rainfall_used":       round(rainfall, 1) if out['model_uses_rainfall'] else None,
+        "historical_context":  hist,
+    })
 
 
 @app.route('/recommend', methods=['POST'])
 def recommend():
-    if not model or not encoders:
+    if bundle is None:
         return jsonify({"error": "Model not loaded"}), 500
 
-    data     = request.json
-    district = data.get('district')
-    area     = float(data.get('area'))
+    data     = request.json or {}
+    district = (data.get('district') or '').upper()
     slope    = data.get('slope', 'Gentle')
     season   = data.get('season', 'Kharif')
-
-    rainfall = data.get('rainfall')
-    if not rainfall or float(rainfall) == 0:
-        rainfall = _get_district_annual_avg_rainfall(district)
-    else:
-        rainfall = float(rainfall)
+    try:
+        area = float(data.get('area'))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Area must be a number of hectares."}), 400
 
     slope_suitability = {
         'Flat':   ['Rice', 'Wheat', 'Jute', 'Potato', 'Sugarcane'],
-        'Gentle': ['Maize', 'Soyabean', 'Pulses', 'Vegetables', 'Potato', 'Rice',
-                   'Banana', 'Tapioca', 'Sweet potato', 'Cowpea'],
         'Steep':  ['Tea', 'Coffee', 'Arecanut', 'Black pepper', 'Cashewnut',
                    'Turmeric', 'Ginger', 'Dry chillies'],
     }
 
-    all_crops  = list(encoders['crop'].classes_)
+    # Only recommend crops that have actually been grown in this district and
+    # season: for those, the model has real history to go on.
+    grown_here = sorted({c for d, c, s in bundle['support'] if d == district and s == season})
+    if slope in slope_suitability:
+        filtered = [c for c in grown_here if any(k.lower() in c.lower() for k in slope_suitability[slope])]
+        grown_here = filtered or grown_here
+
     candidates = []
+    for crop in grown_here:
+        try:
+            out = _predict(district, season, crop, area)
+        except PredictionError:
+            continue
+        crop_info = CROP_KNOWLEDGE.get(crop, {})
+        price     = crop_info.get('price_per_quintal', 2000)
+        candidates.append({
+            "crop":        crop,
+            "production":  round(out['production'], 2),
+            "yield":       round(out['yield'], 3),
+            # tonnes x 10 quintals/tonne x price per quintal
+            "revenue_est": round(out['production'] * 10 * price, 0),
+            "water_need":  crop_info.get('water', 'Medium'),
+        })
 
-    for crop in all_crops:
-        suitable = slope in ('Gentle',)  # Gentle is okay for most
-        if slope == 'Steep':
-            suitable = any(s.lower() in crop.lower() for s in slope_suitability['Steep'])
-        elif slope == 'Flat':
-            suitable = any(s.lower() in crop.lower() for s in slope_suitability['Flat'])
-
-        if suitable:
-            try:
-                features       = _make_features(district, season, crop, area, rainfall)
-                pred_log       = model.predict(features)[0]
-                pred_prod      = np.expm1(pred_log)
-                pred_yield     = pred_prod / area if area > 0 else 0
-                crop_info      = CROP_KNOWLEDGE.get(crop, {})
-                price          = crop_info.get('price_per_quintal', 2000)
-                # Revenue estimate: yield (t/ha) * area * 10 quintals/tonne * price
-                revenue_est    = pred_yield * area * 10 * price
-
-                candidates.append({
-                    "crop":         crop,
-                    "production":   round(pred_prod, 2),
-                    "yield":        round(pred_yield, 3),
-                    "revenue_est":  round(revenue_est, 0),
-                    "water_need":   crop_info.get('water', 'Medium'),
-                })
-            except Exception as e:
-                continue
-
-    candidates.sort(key=lambda x: x['yield'], reverse=True)
+    # Rank by expected revenue, not tonnes: a tonne of tapioca and a tonne of
+    # turmeric are worth very different amounts.
+    candidates.sort(key=lambda x: x['revenue_est'], reverse=True)
 
     return jsonify({
         "recommendations": candidates[:5],
         "best_crop":       candidates[0] if candidates else None,
-        "rainfall_used":   round(rainfall, 1)
+        "ranked_by":       "expected revenue (predicted production x reference price)",
+        "considered":      f"{len(candidates)} crops with past records in {district} during {season}",
     })
 
 
@@ -469,18 +498,13 @@ def pro_analysis():
 
     # ── 1. Market Estimate ──────────────────────────────────────────────────────
     price = crop_info['price_per_quintal']
+    model_note = None
     try:
-        if model and encoders:
-            features    = _make_features(district, season, crop, area, rainfall)
-            pred_log    = model.predict(features)[0]
-            pred_prod   = np.expm1(pred_log)
-            pred_yield  = pred_prod / area if area > 0 else 0
-        else:
-            pred_prod   = 0
-            pred_yield  = 0
-    except Exception:
+        out        = _predict(district, season, crop, area, rainfall)
+        pred_prod  = out['production']
+    except (PredictionError, ValueError) as e:
         pred_prod  = 0
-        pred_yield = 0
+        model_note = str(e)
 
     # Revenue = production (tonnes) * 10 quintals/tonne * price/quintal
     revenue_estimate = round(pred_prod * 10 * price, 0)
@@ -604,6 +628,7 @@ def pro_analysis():
             "cost_estimate":     cost_estimate,
             "profit_estimate":   profit_estimate,
             "predicted_production_t": round(pred_prod, 2),
+            "model_note":        model_note,
             "price_trend":       price_trend,
         },
         "soil": soil_health,
@@ -623,79 +648,39 @@ def model_info():
 
 @app.route('/drift-report', methods=['GET'])
 def drift_report():
-    """
-    Return drift report. Uses cached report if fresh (< 10 min),
-    otherwise runs a new check synchronously.
-    """
-    # Use cache if recent
-    if os.path.exists(DRIFT_CACHE):
-        with open(DRIFT_CACHE) as f:
-            cached = json.load(f)
+    """Drift report on logged requests; cached for 10 minutes."""
+    if ml_config.DRIFT_CACHE_PATH.exists():
+        cached = json.loads(ml_config.DRIFT_CACHE_PATH.read_text())
         ts = cached.get('timestamp', '')
-        if ts:
-            age = (datetime.datetime.now() - datetime.datetime.fromisoformat(ts)).total_seconds()
-            if age < 600:  # 10 minutes
-                return jsonify(cached)
-
-    # Run drift check
+        if ts and (datetime.datetime.now() - datetime.datetime.fromisoformat(ts)).total_seconds() < 600:
+            return jsonify(cached)
     try:
-        sys.path.insert(0, WORKSPACE)
-        from drift_monitor import run_drift_check
-        report = run_drift_check()
-        return jsonify(report)
+        return jsonify(run_drift_check())
     except Exception as e:
         return jsonify({'error': str(e), 'status': 'error'}), 500
 
 
 @app.route('/retrain', methods=['POST'])
 def retrain():
-    """Trigger the retraining pipeline. Runs synchronously and returns result."""
-    script = os.path.join(WORKSPACE, 'retrain_pipeline.py')
+    """Re-run the backtest on current data (including new_observations.csv) and
+    replace the deployed model only if a challenger beats it or new data arrived."""
     try:
-        result = subprocess.run(
-            [sys.executable, script],
-            capture_output=True, text=True, timeout=300,
-            cwd=WORKSPACE
-        )
-        # Find the JSON block in stdout
-        stdout = result.stdout.strip()
-        lines  = stdout.split('\n')
-        json_str = ''
-        for i, line in enumerate(lines):
-            if line.strip().startswith('{'):
-                json_str = '\n'.join(lines[i:])
-                break
-
-        if json_str:
-            data = json.loads(json_str)
-            # Reload model if upgraded
-            if data.get('status') == 'upgraded':
-                global model, encoders, scaler
-                try:
-                    with open(os.path.join(WORKSPACE, 'agriculture_model_improved.pkl'), 'rb') as f:
-                        model = pickle.load(f)
-                    with open(os.path.join(WORKSPACE, 'label_encoders_improved.pkl'), 'rb') as f:
-                        encoders = pickle.load(f)
-                        scaler = encoders.get('scaler')
-                except Exception:
-                    pass
-            return jsonify(data)
-        else:
-            return jsonify({'error': 'No JSON output from pipeline', 'stdout': stdout}), 500
-    except subprocess.TimeoutExpired:
-        return jsonify({'error': 'Retraining timed out (>5 min)'}), 504
+        result = run_pipeline('retrain')
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+    if result.get('status') in ('upgraded', 'refreshed'):
+        _load_model()
+    return jsonify(result)
 
 
 @app.route('/prediction-stats', methods=['GET'])
 def prediction_stats():
     """Return distribution stats of the last 100 logged predictions."""
-    if not os.path.exists(PRED_LOG_PATH):
+    if not ml_config.PRED_LOG_PATH.exists():
         return jsonify({'count': 0, 'by_district': {}, 'by_crop': {}, 'by_season': {}})
 
     rows = []
-    with open(PRED_LOG_PATH) as f:
+    with open(ml_config.PRED_LOG_PATH) as f:
         for line in f:
             line = line.strip()
             if line:
