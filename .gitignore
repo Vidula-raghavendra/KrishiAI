@@ -18,3 +18,11 @@ build/
 # Large Data (Optional - comment out if you want to push these)
 # *.csv
 # training_workspace/
+
+# MLflow runs and runtime artefacts (generated locally)
+mlruns/
+prediction_log.jsonl
+drift_report.json
+
+# AI-assistant config (kept local)
+.claude/

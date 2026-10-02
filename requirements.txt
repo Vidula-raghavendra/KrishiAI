@@ -1,0 +1,8 @@
+flask
+flask-cors
+pandas
+numpy
+scikit-learn==1.6.1   # must match the version the .pkl files were saved with
+mlflow
+requests
+scipy

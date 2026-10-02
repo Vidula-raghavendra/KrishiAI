@@ -1,8 +1,0 @@
-artifact_location: file:///C:/Users/ragha/Datanyx_Project/archive--1-/training_workspace/mlruns/506861572018071301
-creation_time: 1775697316178
-experiment_id: '506861572018071301'
-last_update_time: 1775697316178
-lifecycle_stage: active
-name: agriculture-yield-prediction
-trace_location: null
-workspace: default
