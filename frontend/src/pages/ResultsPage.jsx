@@ -109,11 +109,11 @@ const ResultsPage = ({ language, setLanguage }) => {
                                 </div>
                                 <div>
                                     <h3 style={{ margin: 0, color: '#1A3C34' }}>
-                                        {t.yield_prediction || 'ML Yield Prediction'}
+                                        {t.yield_prediction || 'Yield Prediction'}
                                     </h3>
                                     <span style={{ fontSize: '0.85rem', color: '#666' }}>
-                                        {formData?.crop} &nbsp;|&nbsp; {inputAreaAcres} acres &nbsp;|&nbsp;
-                                        Rainfall used: {prediction.rainfall_used} mm
+                                        {formData?.crop} &nbsp;|&nbsp; {inputAreaAcres} acres
+                                        {prediction.rainfall_used != null && <> &nbsp;|&nbsp; Rainfall used: {prediction.rainfall_used} mm</>}
                                     </span>
                                 </div>
                             </div>
@@ -141,6 +141,11 @@ const ResultsPage = ({ language, setLanguage }) => {
                                         {totalProd}
                                         <span style={{ fontSize: '1rem', fontWeight: 'normal' }}> tonnes</span>
                                     </span>
+                                    {prediction.production_range && (
+                                        <span style={{ display: 'block', fontSize: '0.75rem', color: '#888' }}>
+                                            likely range {prediction.production_range[0]}–{prediction.production_range[1]} t
+                                        </span>
+                                    )}
                                 </div>
                                 {prediction.historical_context && (
                                     <div className="stat-box">
@@ -159,6 +164,12 @@ const ResultsPage = ({ language, setLanguage }) => {
                                     </div>
                                 )}
                             </div>
+                            {prediction.confidence_note && (
+                                <p style={{ marginTop: '1rem', fontSize: '0.85rem', color: '#92400e',
+                                    background: '#fef3c7', padding: '0.6rem 0.8rem', borderRadius: '8px' }}>
+                                    {prediction.confidence_note}
+                                </p>
+                            )}
                         </div>
                     )}
 
