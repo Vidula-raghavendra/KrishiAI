@@ -6,7 +6,7 @@ Crop-yield prediction and farm advisory for the districts of Meghalaya, with a f
 
 ## Highlights
 
-- **Yield model** — Gradient Boosting Regressor trained on 927 records (11 districts, 26 crops, 6 seasons) joined with historical rainfall. **R² = 0.93, MAE = 796 tonnes.**
+- **Yield model** — Gradient Boosting Regressor trained on 927 records (11 districts, 28 crops, 6 seasons) joined with historical rainfall. **R² = 0.93, MAE = 796 tonnes.**
 - **Farmer tool** — pick a district, season, crop, area and budget to get a yield prediction, crop recommendations, a forecast and an advisory, with district slope and 12-month rainfall context.
 - **Pro analysis** — deeper per-district breakdowns and crop statistics.
 - **MLOps dashboard**
